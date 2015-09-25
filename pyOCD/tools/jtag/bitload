@@ -1,0 +1,45 @@
+#! /usr/bin/env python
+import subprocess
+import sys, os, tempfile
+import atexit
+
+if len(sys.argv) == 1:
+    print "usage: %s <bitfile>" % sys.argv[0]
+    sys.exit(1)
+
+paths = \
+{
+    "xilinx_xvc.py": os.path.dirname(os.path.realpath(sys.argv[0]))
+    ,"impact" : "/apps/xilinx/14.4/14.4/ISE_DS/ISE/bin/linuxamd/"
+}
+
+batch = \
+'''
+# set boundary scan mode
+setMode -bscan
+# configure target
+setCable -target "xilinx_xvc host=localhost:2542 disableversioncheck=true"
+# add this device to the chain
+addDevice -p 1 -file {bitfile}
+# program the device
+program -p 1
+quit
+'''.format(bitfile=os.path.abspath(sys.argv[1]))
+
+p = "xilinx_xvc.py"
+args = ["ftdi","Digilent Adept USB Device A","FTDI_GPIO_MASK=0x8b","FTDI_GPIO_OUT=0x88"]
+xvcproc = subprocess.Popen([os.path.join(paths[p],p)]+args)
+
+# Make sure xvc listener is closed no matter what happens
+atexit.register(xvcproc.terminate)
+
+with tempfile.NamedTemporaryFile(delete=True) as tmpfh:
+    tmpfh.write(batch)
+    tmpfh.file.flush()
+
+    os.chdir("/tmp")     # change to tmp directory so iMpact can
+                         # happily create its stupid log file
+
+    p = "impact"
+    args = ["-batch", tmpfh.name]
+    retcode = subprocess.call([os.path.join(paths[p],p)]+args)
