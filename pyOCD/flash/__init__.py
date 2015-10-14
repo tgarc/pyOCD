@@ -14,7 +14,6 @@
  See the License for the specific language governing permissions and
  limitations under the License.
 """
-
 from flash_cortex_m import Flash_cortex_m
 from flash_klxx import Flash_klxx
 from flash_kl28z import Flash_kl28z
@@ -51,6 +50,7 @@ FLASH = {
          'nrf51': Flash_nrf51,
          'stm32f103rc': Flash_stm32f103rc,
          'stm32f051': Flash_stm32f051,
+         'stm32f2x': Flash_cortex_m
          'maxwsnenv': Flash_maxwsnenv,
          'max32600mbed': Flash_max32600mbed,
          'w7500': Flash_w7500,

@@ -14,7 +14,6 @@
  See the License for the specific language governing permissions and
  limitations under the License.
 """
-
 import cortex_m
 import target_kinetis
 import target_kl02z
@@ -36,6 +35,7 @@ import target_stm32f051
 import target_maxwsnenv
 import target_max32600mbed
 import target_w7500
+import target_stm32f2x
 import semihost
 
 TARGET = {
@@ -57,6 +57,7 @@ TARGET = {
           'nrf51': target_nrf51.NRF51,
           'stm32f103rc': target_stm32f103rc.STM32F103RC,
           'stm32f051': target_stm32f051.STM32F051,
+          'stm32f2x': target_stm32f2x.STM32F2X
           'maxwsnenv': target_maxwsnenv.MAXWSNENV,
           'max32600mbed': target_max32600mbed.MAX32600MBED,
           'w7500': target_w7500.W7500,
