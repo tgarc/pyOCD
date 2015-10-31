@@ -50,7 +50,7 @@ FLASH = {
          'nrf51': Flash_nrf51,
          'stm32f103rc': Flash_stm32f103rc,
          'stm32f051': Flash_stm32f051,
-         'stm32f2x': Flash_cortex_m
+         'stm32f2x': Flash_cortex_m,
          'maxwsnenv': Flash_maxwsnenv,
          'max32600mbed': Flash_max32600mbed,
          'w7500': Flash_w7500,
