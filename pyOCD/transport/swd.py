@@ -15,22 +15,25 @@
  limitations under the License.
 """
 
-from swd_core import SWD_Protocol
 from transport import Transport
 import logging
-from time import sleep
 
-# !! This value are A[2:3] and not A[3:2]
 DP_REG = {'IDCODE' : 0x00,
           'ABORT' : 0x00,
           'CTRL_STAT': 0x04,
+          'WCR' : 0x04,
           'SELECT': 0x08
           }
+
 AP_REG = {'CSW' : 0x00,
           'TAR' : 0x04,
           'DRW' : 0x0C,
           'IDR' : 0xFC
           }
+
+SWD_ACK_OK = 1
+SWD_ACK_WAIT = 2
+SWD_ACK_FAULT = 4
 
 IDCODE = 0 << 2
 AP_ACC = 1 << 0
@@ -39,6 +42,12 @@ READ = 1 << 1
 WRITE = 0 << 1
 VALUE_MATCH = 1 << 4
 MATCH_MASK = 1 << 5
+
+ORUNERRCLR = 0b100
+WDERRCLR   = 0b011
+STKERRCLR  = 0b010
+STKCMPCLRa = 0b001
+DAPABORT   = 0b000
 
 APBANKSEL = 0x000000f0
 
@@ -66,95 +75,146 @@ TRANSFER_SIZE = {8: CSW_SIZE8,
                  32: CSW_SIZE32
                  }
 
-# Response values to DAP_Connect command
-DAP_MODE_SWD = 1
-DAP_MODE_JTAG = 2
 
-# DP Control / Status Register bit definitions
-CTRLSTAT_STICKYORUN = 0x00000002
-CTRLSTAT_STICKYCMP = 0x00000010
-CTRLSTAT_STICKYERR = 0x00000020
 
-COMMANDS_PER_DAP_TRANSFER = 12
+reverse_bits = lambda b,w: ("{0:0%db}" % w).format(b)[::-1]
+
+def get_word(data,i=0,pop=False): 
+    d = data[3+i] << 24 | data[2+i] << 16 | data[1+i] << 8 | data[0+i]
+    if pop: del d[i:i+4]
+    return d
+
 
 class SWD(Transport):
-    """
-    This class implements the SWD protocol
-    """
     def __init__(self, interface):
         super(SWD, self).__init__(interface)
-        self.protocol = SWD_Protocol(interface)
-        self.packet_max_count = 0
-        self.packet_max_size = 0
         self.csw = -1
         self.dp_select = -1
-        self.deferred_transfer = False
-        self.request_list = []
-        self.data_list = []
-        self.data_read_list = []
 
     def init(self, frequency=1000000):
         # Flush to be safe
         self.flush()
-        # connect to DAP, check for SWD or JTAG
-        self.mode = self.protocol.connect()
-        # set clock frequency
-        self.protocol.setSWJClock(frequency)
-        # configure transfer
-        self.protocol.transferConfigure()
-        if (self.mode == DAP_MODE_SWD):
-            # configure swd protocol
-            self.protocol.swdConfigure()
-            # switch from jtag to swd
-            self.JTAG2SWD()
-            # read ID code
-            logging.info('IDCODE: 0x%X', self.readDP(DP_REG['IDCODE']))
-            # clear errors
-            self.protocol.writeAbort(0x1e);
-        elif (self.mode == DAP_MODE_JTAG):
-            # configure jtag protocol
-            self.protocol.jtagConfigure(4)
-            # Test logic reset, run test idle
-            self.protocol.swjSequence([0x1F])
-            # read ID code
-            logging.info('IDCODE: 0x%X', self.protocol.jtagIDCode())
-            # clear errors
-            self.writeDP(DP_REG['CTRL_STAT'], CTRLSTAT_STICKYERR | CTRLSTAT_STICKYCMP | CTRLSTAT_STICKYORUN)
-        return
 
-    def uninit(self):
-        self.flush()
-        self.protocol.disconnect()
-        return
+        # set clock frequency
+        # self.protocol.setSWJClock(frequency)
+
+        # configure transfer
+        # self.protocol.transferConfigure()
+
+        # switch to SWD mode reset state
+        self.JTAG2SWD()
+
+        # clear errors
+        self.writeDP(DP_REG['ABORT'], 0x1e)
+
+        # configure swd protocol
+        self.writeDP(DP_REG['SELECT'], 1)   # set the CTRLSEL bit to switch
+                                            # access from DP.CTRL/STAT to DP.WCR
+        self.writeDP(DP_REG['WCR'], 0)      
+        self.writeDP(DP_REG['SELECT'], 0)   # switch back to DP.CTRL/STAT
+
 
     def JTAG2SWD(self):
-        data = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
-        self.protocol.swjSequence(data)
+        # reset the state machine for JTAG/SWD
+        self.interface.write('1'*56)
 
-        data = [0x9e, 0xe7]
-        self.protocol.swjSequence(data)
+        # send the 16bit JTAG-to-SWD sequence
+        self.interface.write(reverse_bits(0x9EE7,w=16))
 
-        data = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
-        self.protocol.swjSequence(data)
+        # If we were already in SWD mode, make sure SWD is in reset state
+        self.interface.write('1'*56)
 
-        data = [0x00]
-        self.protocol.swjSequence(data)
+        self.interface.write('0'*8)
 
-    def info(self, request):
-        self.flush()
-        resp = None
-        try:
-            resp = self.protocol.dapInfo(request)
-        except KeyError:
-            logging.error('request %s not supported', request)
-        return resp
+        # read ID code to confirm synchronization
+        logging.info('IDCODE: 0x%X', self.readDP(DP_REG['IDCODE']))
+
+    def _write(self, data):
+        parity = data
+        parity = (parity ^ (parity >> 16))
+        parity = (parity ^ (parity >> 8))
+        parity = (parity ^ (parity >> 4))
+        parity = (parity ^ (parity >> 2))
+        parity = (parity ^ (parity >> 1)) & 1
+
+        # Insert one turnaround period (needed between reception of ACK and
+        # transmission of data) followed by the data word and parity bit
+        data = '0' + reverse_bits(data,w=32) + ('1' if parity else '0')
+
+        print "WDATA", data
+        self.interface.write(data)
+
+    def _read(self):
+        # read 32bit word + 1 bit parity, and clock 1 additional cycle to
+        # satisfy turnaround for next transmissoin
+        x = self.interface.read(34)
+        print "RDATA", x[31::-1]
+        data, presp = int(x[31::-1], 2), int(x[32], 2)
+
+        parity = data
+        parity = (parity ^ (parity >> 16))
+        parity = (parity ^ (parity >> 8))
+        parity = (parity ^ (parity >> 4))
+        parity = (parity ^ (parity >> 2))
+        parity = (parity ^ (parity >> 1)) & 1
+
+        if parity ^ presp:
+            raise ValueError("Parity Error")
+
+        return data
+
+    def check(self):
+        self.writeDP(DP_REG['SELECT'], 0)            # set SELECT 0
+        self.writeDP(DP_REG['CTRL_STAT'], 0x50000000) # set CTRL/STAT CxxxPWRUPREQ
+        self.readDP(DP_REG['CTRL_STAT'])             # read CTRL/STAT CxxxPWRUPREQ
+
+        return
+
+    def _request(self, rqst):
+        """
+        Sends an SWD 4 bit request packet (APnDP | RnW | A[2:3]) and
+        verifies the response from the target
+        """
+        parity = rqst
+        parity ^= parity >> 1
+        parity ^= parity >> 2        
+        parity &= 1
+
+        rqst = '1{}{}01'.format(reverse_bits(rqst,w=4), '1' if parity else '0')
+        print 'RQST ', rqst
+        self.interface.write(rqst)
+
+        # wait 1 TRN then read 3 bit ACK
+        ack = self.interface.read(4)
+        print 'ACK  ', ack[3:0:-1]
+        ack = int(ack[3:0:-1],2)
+
+        if ack != SWD_ACK_OK:
+            raise Transport.TransferError('Received invalid ACK (0b{:03b})'.format(ack))
+
+        return ack
+
+    def readDP(self, addr, mode=Transport.READ_NOW):
+        self._request(addr | 0b10)
+        return self._read()
+
+    def writeDP(self, addr, data):
+        self._request(addr | 0b00)
+        self._write(data)
+        return True
+
+    def readAP(self, addr, mode=Transport.READ_NOW):
+        self._request(addr | 0b11)
+        return self._read()
 
     def clearStickyErr(self):
-        if (self.mode == DAP_MODE_SWD):
-            self.writeDP(0x0, (1 << 2))
-        elif (self.mode == DAP_MODE_JTAG):
-            self.writeDP(DP_REG['CTRL_STAT'], CTRLSTAT_STICKYERR)
+        self.writeDP(DP_REG['ABORT'], STKERRCLR)
 
+    def writeAP(self, addr, data):
+        self._request(addr | 0b01)
+        self._write(data)
+        return True
+    
     def writeMem(self, addr, data, transfer_size=32):
         self.writeAP(AP_REG['CSW'], CSW_VALUE | TRANSFER_SIZE[transfer_size])
 
@@ -163,242 +223,40 @@ class SWD(Transport):
         elif transfer_size == 16:
             data = data << ((addr & 0x02) << 3)
 
-        self._write(WRITE | AP_ACC | AP_REG['TAR'], addr)
-        self._write(WRITE | AP_ACC | AP_REG['DRW'], data)
-
-        # If not in deferred mode flush after calls to _read or _write
-        if not self.deferred_transfer:
-            self.flush()
+        self.writeAP(AP_REG['TAR'], addr)
+        self.writeAP(AP_REG['DRW'], data)
 
     def readMem(self, addr, transfer_size=32, mode=Transport.READ_NOW):
-        res = None
-        if mode in (Transport.READ_START, Transport.READ_NOW):
-            self.writeAP(AP_REG['CSW'], CSW_VALUE | TRANSFER_SIZE[transfer_size])
-            self._write(WRITE | AP_ACC | AP_REG['TAR'], addr)
-            self._write(READ | AP_ACC | AP_REG['DRW'])
+        self.writeAP(AP_REG['CSW'], CSW_VALUE | TRANSFER_SIZE[transfer_size])
+        self.writeAP(AP_REG['TAR'], addr)
+        
+        resp = self.readAP(AP_REG['DRW'])
 
-        if mode in (Transport.READ_NOW, Transport.READ_END):
-            resp = self._read()
-            res = (resp[0] << 0) | \
-                    (resp[1] << 8) | \
-                    (resp[2] << 16) | \
-                    (resp[3] << 24)
+        if transfer_size == 8:
+            resp = (resp >> ((addr & 0x03) << 3) & 0xff)
+        elif transfer_size == 16:
+            resp = (resp >> ((addr & 0x02) << 3) & 0xffff)
 
-            # All READ_STARTs must have been finished with READ_END before using READ_NOW
-            assert (mode != Transport.READ_NOW) or (len(self.data_read_list) == 0)
-
-            if transfer_size == 8:
-                res = (res >> ((addr & 0x03) << 3) & 0xff)
-            elif transfer_size == 16:
-                res = (res >> ((addr & 0x02) << 3) & 0xffff)
-
-        # If not in deferred mode flush after calls to _read or _write
-        if not self.deferred_transfer:
-            self.flush()
-        return res
+        return resp
 
     # write aligned word ("data" are words)
     def writeBlock32(self, addr, data):
         # put address in TAR
         self.writeAP(AP_REG['CSW'], CSW_VALUE | CSW_SIZE32)
-        self.writeAP(AP_REG['TAR'], addr)
-        try:
-            self._transferBlock(len(data), WRITE | AP_ACC | AP_REG['DRW'], data)
-        except Transport.TransferError:
-            self.clearStickyErr()
-            raise
-        # If not in deferred mode flush after calls to _read or _write
-        if not self.deferred_transfer:
-            self.flush()
+
+        for i in range(len(data)//4):
+            self.writeAP(AP_REG['TAR'], addr)
+            self.writeAP(AP_REG['DRW'], get_word(data))
+            addr += 4
 
     # read aligned word (the size is in words)
     def readBlock32(self, addr, size):
-        # put address in TAR
         self.writeAP(AP_REG['CSW'], CSW_VALUE | CSW_SIZE32)
-        self.writeAP(AP_REG['TAR'], addr)
+        
         data = []
-        try:
-            resp = self._transferBlock(size, READ | AP_ACC | AP_REG['DRW'])
-        except Transport.TransferError:
-            self.clearStickyErr()
-            raise
-        for i in range(len(resp) / 4):
-            data.append((resp[i * 4 + 0] << 0) | \
-                         (resp[i * 4 + 1] << 8) | \
-                         (resp[i * 4 + 2] << 16) | \
-                         (resp[i * 4 + 3] << 24))
-        # If not in deferred mode flush after calls to _read or _write
-        if not self.deferred_transfer:
-            self.flush()
+        for i in range(size):
+            self.writeAP(AP_REG['TAR'], addr)
+            data.append(self.readAP(AP_REG['DRW']))
+            addr += 4
+
         return data
-
-
-    def readDP(self, addr, mode=Transport.READ_NOW):
-        res = None
-        if mode in (Transport.READ_START, Transport.READ_NOW):
-            self._write(READ | DP_ACC | (addr & 0x0c))
-
-        if mode in (Transport.READ_NOW, Transport.READ_END):
-            resp = self._read()
-            res = (resp[0] << 0) | \
-                    (resp[1] << 8) | \
-                    (resp[2] << 16) | \
-                    (resp[3] << 24)
-
-            # All READ_STARTs must have been finished with READ_END before using READ_NOW
-            assert (mode != Transport.READ_NOW) or (len(self.data_read_list) == 0)
-
-        # If not in deferred mode flush after calls to _read or _write
-        if not self.deferred_transfer:
-            self.flush()
-        return res
-
-    def writeDP(self, addr, data):
-        if addr == DP_REG['SELECT']:
-            if data == self.dp_select:
-                return
-            self.dp_select = data
-
-        self._write(WRITE | DP_ACC | (addr & 0x0c), data)
-
-        # If not in deferred mode flush after calls to _read or _write
-        if not self.deferred_transfer:
-            self.flush()
-        return True
-
-    def writeAP(self, addr, data):
-        ap_sel = addr & 0xff000000
-        bank_sel = addr & APBANKSEL
-        self.writeDP(DP_REG['SELECT'], ap_sel | bank_sel)
-
-        if addr == AP_REG['CSW']:
-            if data == self.csw:
-                return
-            self.csw = data
-
-        self._write(WRITE | AP_ACC | (addr & 0x0c), data)
-        # If not in deferred mode flush after calls to _read or _write
-        if not self.deferred_transfer:
-            self.flush()
-
-        return True
-
-    def readAP(self, addr, mode=Transport.READ_NOW):
-        res = None
-        if mode in (Transport.READ_START, Transport.READ_NOW):
-            ap_sel = addr & 0xff000000
-            bank_sel = addr & APBANKSEL
-
-            self.writeDP(DP_REG['SELECT'], ap_sel | bank_sel)
-            self._write(READ | AP_ACC | (addr & 0x0c))
-
-        if mode in (Transport.READ_NOW, Transport.READ_END):
-            resp = self._read()
-            res = (resp[0] << 0) | \
-                    (resp[1] << 8) | \
-                    (resp[2] << 16) | \
-                    (resp[3] << 24)
-
-            # All READ_STARTs must have been finished with READ_END before using READ_NOW
-            assert (mode != Transport.READ_NOW) or (len(self.data_read_list) == 0)
-
-        # If not in deferred mode flush after calls to _read or _write
-        if not self.deferred_transfer:
-            self.flush()
-
-        return res
-
-    def reset(self):
-        self.flush()
-        self.protocol.setSWJPins(0, 'nRESET')
-        sleep(0.1)
-        self.protocol.setSWJPins(0x80, 'nRESET')
-        sleep(0.1)
-
-    def assertReset(self, asserted):
-        self.flush()
-        if asserted:
-            self.protocol.setSWJPins(0, 'nRESET')
-        else:
-            self.protocol.setSWJPins(0x80, 'nRESET')
-
-    def setClock(self, frequency):
-        self.flush()
-        self.protocol.setSWJClock(frequency)
-
-    def setDeferredTransfer(self, enable):
-        """
-        Allow transfers to be delayed and buffered
-
-        By default deferred transfers are turned off.  All reads and
-        writes will be completed by the time the function returns.
-
-        When enabled packets are buffered and sent all at once, which
-        increases speed.  When memory is written to, the transfer
-        might take place immediately, or might take place on a future
-        memory write.  This means that an invalid write could cause an
-        exception to occur on a later, unrelated write.  To guarantee
-        that previous writes are complete call the flush() function.
-
-        The behaviour of read operations is determined by the modes
-        READ_START, READ_NOW and READ_END.  The option READ_NOW is the
-        default and will cause the read to flush all previous writes,
-        and read the data immediately.  To improve performance, multiple
-        reads can be made using READ_START and finished later with READ_NOW.
-        This allows the reads to be buffered and sent at once.  Note - All
-        READ_ENDs must be called before a call using READ_NOW can be made.
-        """
-        if self.deferred_transfer and not enable:
-            self.flush()
-        self.deferred_transfer = enable
-
-    def flush(self):
-        """
-        Flush out all commands
-        """
-        transfer_count = len(self.request_list)
-        if transfer_count > 0:
-            assert transfer_count <= COMMANDS_PER_DAP_TRANSFER
-            try:
-                data = self.protocol.transfer(transfer_count, self.request_list, self.data_list)
-                self.data_read_list.extend(data)
-            except Transport.TransferError:
-                # Dump any pending commands
-                self.request_list = []
-                self.data_list = []
-                # Dump any data read
-                self.data_read_list = []
-                # Invalidate cached registers
-                self.csw = -1
-                self.dp_select = -1
-                # Clear error
-                self.clearStickyErr()
-                raise
-            self.request_list = []
-            self.data_list = []
-
-    def _write(self, request, data=0):
-        """
-        Write a single command
-        """
-        assert type(request) in (int, long), "request is not an int"
-        assert type(data) in (int, long), "data is not an int"
-        self.request_list.append(request)
-        self.data_list.append(data)
-        transfer_count = len(self.request_list)
-        if (transfer_count >= COMMANDS_PER_DAP_TRANSFER):
-            self.flush()
-
-    def _read(self):
-        """
-        Read the response from a single command
-        """
-        if len(self.data_read_list) < 4:
-            self.flush()
-        data = self.data_read_list[0:4]
-        self.data_read_list = self.data_read_list[4:]
-        return data
-
-    def _transferBlock(self, count, request, data=[0]):
-        self.flush()
-        return self.protocol.transferBlock(count, request, data)

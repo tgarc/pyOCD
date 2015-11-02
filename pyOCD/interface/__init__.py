@@ -20,8 +20,10 @@ import logging
 from hidapi_backend import HidApiUSB
 from pyusb_backend import PyUSB
 from pywinusb_backend import PyWinUSB
+from ftdi_backend import FTD2xx
 
 INTERFACE = {
+             'ftdi': FTD2xx,
              'hidapiusb': HidApiUSB,
              'pyusb': PyUSB,
              'pywinusb': PyWinUSB

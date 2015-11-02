@@ -16,6 +16,8 @@
 """
 
 from cmsis_dap import CMSIS_DAP
+from swd import SWD
 
-TRANSPORT = {'cmsis_dap': CMSIS_DAP
+TRANSPORT = {'cmsis_dap': CMSIS_DAP,
+             'swd': SWD
             }
