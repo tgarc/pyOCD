@@ -24,6 +24,9 @@ from ..utility import conversion
 import logging
 import struct
 
+swapword = lambda x:  (x & 0xff000000) >> 24 | (x & 0x00ff0000) >>  8 \
+                    | (x & 0x0000ff00) <<  8 | (x & 0x000000ff) << 24
+
 # CPUID PARTNO values
 ARM_CortexM0 = 0xC20
 ARM_CortexM1 = 0xC21
@@ -335,9 +338,10 @@ class CortexM(Target):
         RegisterInfo('s31',     64,         'float',        'float'),
         ]
 
-    def __init__(self, link, memoryMap=None):
+    def __init__(self, link, memoryMap=None, big_endian=False):
         super(CortexM, self).__init__(link, memoryMap)
 
+        self.big_endian = big_endian
         self.idcode = 0
         self.hw_breakpoints = []
         self.breakpoints = {}
@@ -878,6 +882,8 @@ class CortexM(Target):
             dhcsr_val = dhcsr_cb()
             assert dhcsr_val & CortexM.S_REGRDY
             val = reg_cb()
+            if self.big_endian:
+                val = swapword(val)
 
             # Special handling for registers that are combined
             # into a single DCRSR number.
@@ -945,7 +951,7 @@ class CortexM(Target):
                 reg = CORE_REGISTER['cfbp']
 
             # write DCRDR
-            self.writeMemory(CortexM.DCRDR, data)
+            self.writeMemory(CortexM.DCRDR, swapword(data) if self.big_endian else data)
 
             # write id in DCRSR and flag to start write transfer
             self.writeMemory(CortexM.DCRSR, reg | CortexM.DCRSR_REGWnR)
@@ -1227,8 +1233,9 @@ class CortexM(Target):
         vals = self.readCoreRegistersRaw(reg_num_list)
         #print("Vals: %s" % vals)
         for reg, regValue in zip(self.register_list, vals):
-            resp += conversion.u32beToHex8le(regValue)
-            logging.debug("GDB reg: %s = 0x%X", reg.name, regValue)
+            valstr = conversion.u32beToHex8le(regValue)
+            resp += valstr
+            logging.debug("GDB reg: %s = 0x%s", reg.name, valstr)
 
         return resp
 
@@ -1243,7 +1250,7 @@ class CortexM(Target):
             regValue = conversion.hex8leToU32be(data)
             reg_num_list.append(reg.reg_num)
             reg_data_list.append(regValue)
-            logging.debug("GDB reg: %s = 0x%X", reg.name, regValue)
+            logging.debug("GDB reg: %s = 0x%X", reg.name, int(data,16) if self.big_endian else regValue)
             data = data[8:]
         self.writeCoreRegistersRaw(reg_num_list, reg_data_list)
 
@@ -1257,7 +1264,7 @@ class CortexM(Target):
         elif reg < len(self.register_list):
             regName = self.register_list[reg].name
             value = conversion.hex8leToU32be(data)
-            logging.debug("GDB: write reg %s: 0x%X", regName, value)
+            logging.debug("GDB: write reg %s: 0x%X", regName, int(data,16) if self.big_endian else value)
             self.writeCoreRegisterRaw(regName, value)
 
     def gdbGetRegister(self, reg):
